@@ -768,7 +768,60 @@ KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props, new StringDe
 - 브로커를 아무리 안정적으로 설정해도, 프로듀서 설정이 잘못되면 전체 시스템에서 데이터가 유실될 수 있음.
 - **데이터 유실 시나리오 예시**
     - **사례 1 (`acks=1` 사용 시):** 프로듀서가 리더에게 메시지를 보내고 '성공' 응답을 받음. 하지만 리더가 팔로워에게 복제하기 직전에 다운됨. 새로운 리더가 선출되지만 해당 메시지는 없음. 프로듀서 애플리케이션은 성공으로 인지했지만 메시지는 유실됨.
+      ```
+      문제 상황 타임라인:
+        1.프로듀서가 파티션 리더에게 메시지 전송
+        2.리더가 로컬 로그에 메시지 저장
+        3.리더가 프로듀서에게 "성공" 응답 전송 ✅
+        4.리더가 팔로워들에게 복제하기 직전에 크래시 💥
+        5.새로운 리더 선출 (기존 팔로워 중 하나)
+        6.새 리더에는 해당 메시지가 없음 - 데이터 유실
+      ```
+      > "아, 이거 완전 클래식한 데이터 유실 케이스네. 프로듀서는 성공했다고 생각하는데 실제로는 메시지가 날아간 거야. 리더가 ack 보내고 죽어버리면 게임 오버지.운영 중에 이런 일 한 번 겪어보면 절대 acks=1 안 쓰게 됨."
     - **사례 2 (오류 미처리 시):** `acks=all`로 설정하고 메시지를 보냈으나, 리더 선출 과정이라 브로커가 '리더 사용 불가' 오류를 반환함. 프로듀서가 이 오류에 대해 재시도 로직 없이 처리를 종료하면, 브로커는 메시지를 받은 적이 없으므로 해당 메시지는 유실됨.
+      ```
+      문제 상황 시퀀스:
+        1.리더 선출 진행 중 (30초 소요)
+        2.프로듀서가 메시지 전송 시도
+        3.브로커가 NotLeaderForPartitionException 반환
+        4.프로듀서가 예외 로그만 찍고 포기
+        5.메시지 영구 유실
+      ```
+    - **사례3 후처리없는 코드(fire and forget)**
+      - 잘못된코드
+        ```
+        # 조용한 실패 - 가장 위험
+        producer.send('my-topic', value=data)
+        # callback 없이 fire-and-forget
+        # 실패해도 모름!
+        ```
+      - 잘된 코드
+        ```
+        producer.send('my-topic', value=data).get()  # 안전
+  
+        # 안전한 코드 - 동기 확인
+        try:
+            future = producer.send('my-topic', value=data)
+            result = future.get(timeout=30)  # 이 줄이 핵심!
+            print(f"전송 성공! offset: {result.offset}")
+        except Exception as e:
+            print(f"전송 실패: {e}")
+            # 실패 처리 로직
+  
+        # 안전한 코드 - 비동기 콜백
+        def on_success(record_metadata):
+            print(f"전송 성공! offset: {record_metadata.offset}")
+        
+        def on_error(exception):
+            print(f"전송 실패: {exception}")
+            # 실패 처리 로직
+        
+        # 콜백과 함께 전송
+        future = producer.send('my-topic', value=data)
+        future.add_callback(on_success)
+        future.add_errback(on_error)
+        ```
+      
 - **핵심 원칙**
     - **(1) `acks` 설정:** 신뢰성 요구사항에 맞는 `acks` 옵션을 사용해야 함.
     - **(2) 오류 처리:** 설정과 코드 양쪽에서 오류를 올바르게 처리해야 함.
