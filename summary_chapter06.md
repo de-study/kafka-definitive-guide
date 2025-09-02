@@ -221,7 +221,8 @@ $ bin/kafka-topics.sh --create --topic test --partitions 1 --replication-factor 
 
 **3. 요청 처리 흐름**
 
-![image.png](attachment:2df31872-4e58-46ac-9581-d0cf83904c2c:image.png)
+<img width="616" height="354" alt="image" src="https://github.com/user-attachments/assets/b9158ce0-e1d1-410c-8b22-255fba177d9c" />
+
 
 - `Acceptor Thread`: 연결 수락 후 Processor Thread에 전달
 - `Processor(Network) Thread`: 요청을 큐에 넣고 응답 큐에서 결과를 가져와 전송
@@ -251,7 +252,8 @@ $ bin/kafka-topics.sh --create --topic test --partitions 1 --replication-factor 
 
 **5. Metadata 요청**
 
-![image.png](attachment:79ac792e-d6bd-4e2f-a842-628f614e27bc:image.png)
+<img width="496" height="335" alt="image" src="https://github.com/user-attachments/assets/a5f5b765-07f9-4723-80a4-795d37aac319" />
+
 
 - 클라이언트가 토픽, 파티션, 리더 정보를 얻기 위해 전송
 - 모든 브로커에 메타데이터 캐시가 존재 → 어떤 브로커에 보내도 처리 가능
@@ -307,7 +309,8 @@ $ bin/kafka-topics.sh --create --topic test --partitions 1 --replication-factor 
 
 **안전한 메시지 읽기**
 
-![image.png](attachment:45458f9d-cd69-46bc-bfcc-1cd6dc6891dd:image.png)
+<img width="699" height="232" alt="image" src="https://github.com/user-attachments/assets/a0340661-d77c-4756-81fa-deba1d5e6ff2" />
+
 
 - 컨슈머는 **모든 In-Sync Replica(ISR)에 기록된 메시지만 읽을 수 있음**
 - **이유:** 리더만 가지고 있는 메시지를 읽게 하면, 리더 장애 시 **데이터 유실/불일치 발생 가능**
@@ -424,7 +427,8 @@ Kafka가 장기간 대용량 데이터를 저장하는 데 쓰이면서 생기�
 
 ### 3. 랙 인식 적용 시
 
-![image.png](attachment:adf6bfcd-7225-4e89-87d9-6cf03906e5d4:image.png)
+<img width="399" height="309" alt="image" src="https://github.com/user-attachments/assets/c78a5ec4-b6b1-4cc9-9ddc-d028f6962892" />
+
 
 - 브로커 목록을 **랙 교차 순서**로 배열
     - 예시: broker 0·1은 Rack 1, broker 2·3은 Rack 2 → [0,2,1,3] 순서
@@ -553,7 +557,8 @@ Kafka가 장기간 대용량 데이터를 저장하는 데 쓰이면서 생기�
     - **Clean**: 이전에 이미 compact된 영역 (키당 최신 값만 있음)
     - **Dirty**: compaction 이후 새로 기록된 영역
         
-        ![image.png](attachment:a2b6634d-ea9b-42d0-b1a3-d9a77b8a7d45:image.png)
+        <img width="402" height="149" alt="image" src="https://github.com/user-attachments/assets/3cadd88d-20d2-4bef-a279-eb3900148838" />
+
         
 - 브로커는 `log.cleaner.enabled` 옵션을 켜면 compaction 스레드 실행 → 각 스레드는 전체 파티션 크기 대비 더티 메시지의 비율이 가장 높은 파티션을 골라서 압착한 뒤 클린상태로 만듦
 - 스레드는 dirty 영역을 읽고 **오프셋 맵(offset map)** 생성
@@ -564,7 +569,8 @@ Kafka가 장기간 대용량 데이터를 저장하는 데 쓰이면서 생기�
     - 키가 맵에 있으면 → 이미 더 최신 값이 있으므로 삭제
 - 결과: **각 키당 최신 값만 남음**
 
-![image.png](attachment:19558990-e345-47c1-8f89-095d9a304dc1:image.png)
+<img width="352" height="304" alt="image" src="https://github.com/user-attachments/assets/466361f4-dabb-487e-8986-2b62d0f86f32" />
+
 
 ## 6.5.8 삭제된 이벤트
 
