@@ -843,21 +843,171 @@ KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props, new StringDe
 <br>
 
 ### (3) 프로듀서 재시도 설정
+- **재시도 필요한 상황**
+  - 네트워크 지연, 브로커 장애, 리더변경 등 일시적오류 발생
+  - 재시도↑ → 안정성↑(유실위험감소),성능↓(초당처리량) (트레이드오프)
+    ```
+    처리 흐름:
+    1.프로듀서가 메시지 전송 시도
+    2.오류 발생 시 재시도 가능/불가능 판단
+    3.재시도 가능하면 설정된 정책에 따라 재시도
+    4.최대 시간 초과 또는 성공까지 반복
+    ```
+- **재시도관련 설정값**
+  - a.재시도횟수 설정,간격
+    - `retries` :전송 실패 시 최대 몇 번까지 재시도할지 설정, 무한대면 메모리부족위험, 적으면 메시지유실 (3~10회적당)(
+    - `retry.backoff.ms` : 재시도 사이의 대기 시간 (밀리초) ,즉시 재시도하면 브로커에 부하를 주고, 같은 오류가 반복될 가능성이 높음
+    - max_in_flight_requests_per_connection =5 : 재시도 중인 메시지 1개가 있어도 나머지 4개는 처리 가능(비동시처리 최대 task수)
+    ```
+      producer_config = {
+        'retries': 2147483647,  # 기본값: MAX_INT (사실상 무한대)
+        'retry.backoff.ms': 100,  # 기본값: 100ms (재시도 간격) 긴간격(5000)
+    }
+    ```
+  - b.타임아웃
+    - `delivery.timeout.ms` : 메시지 전송을 완전히 포기하기까지의 총 시간, 이 시간 안에 retries 횟수만큼 재시도를 반복함
+      - 짧으면: 빠른 실패 감지, 일시적 장애 시 메시지 유실 위험
+      - 길면: 메시지 유실 방지, 장애 시 애플리케이션 블로킹
+    - `request.timeout.ms`  : 개별 요청(한 번의 전송 시도)이 응답을 기다리는 최대 시간
+      - delivery.timeout.ms = request.timeout.ms × retries + (retry.backoff.ms × retries)
+    - `max.block.ms`    : send() 메서드가 블로킹될 수 있는 최대 시간(버퍼가 가득 찬 경우, 메타데이터 가져오는경우)
+    ```
+    producer_config = {
+        'delivery.timeout.ms': 120000,  # 기본값: 120초
+        'request.timeout.ms': 30000,    # 기본값: 30초
+        'max.block.ms': 60000,          # 기본값: 60초
+    }
+    ```
+  - c.멱등성 설정
+  - enable.idempotence :  프로듀서가 중복 메시지 전송을 방지하도록 설정
+    - 프로듀서가 각 메시지에 sequence_number값을 브로커로 전달. 브로커가 중복을 감지(True-성능 오버헤드 발생)
+  - max.in.flight.requests.per.connection : 브로커로부터 응답을 받기 전에 전송할 수 있는 최대 요청 수,
+    - `1` : 순서중시, 성능저하
+    - `5` : 높은 처리량, 재시도시 순서 바뀔수 있음
+    ```
+    producer_config = {
+        'enable.idempotence': False,  # 기본값: False
+        'max.in.flight.requests.per.connection': 5,  # 기본값: 5
+    }
+    ```
+    - 의존성이 있는 설정값
+      - `enable.idempotence=true`
+        ```
+        acks='all' 강제 설정
+        retries > 0 강제 설정
+        max.in.flight.requests.per.connection ≤ 5 제한
+        ```
+      - `delivery.timeout.ms`
+        ```
+        delivery.timeout.ms ≥ linger.ms + request.timeout.ms
+        ```
+
+<details>
+  <summary>실제 설정과 대응</summary>
+  
+### 상황 1: 메시지 유실 발생
+```
+# 문제 상황 재현 - 이런 설정은 메시지 유실을 유발할 수 있다
+risky_config = {
+    'retries': 0,  # 재시도 안 함
+    'acks': '0',   # 확인 안 함
+}
+
+# 해결책 - 안정성 강화
+safe_config = {
+    'retries': 10,
+    'acks': 'all',
+    'enable_idempotence': True,
+}
+```
+상황 2: 성능 저하
+```
+# 성능 문제 설정 - 이건 너무 보수적이라 느릴 수 있다
+slow_config = {
+    'max_in_flight_requests_per_connection': 1,
+    'retry_backoff_ms': 5000,  # 5초씩 대기
+    'delivery_timeout_ms': 600000,  # 10분
+}
+
+# 성능 개선 - 안정성은 유지하면서 속도 향상
+optimized_config = {
+    'max_in_flight_requests_per_connection': 5,
+    'retry_backoff_ms': 100,
+    'delivery_timeout_ms': 120000,  # 2분
+    'enable_idempotence': True,  # 중복 방지는 유지
+}
+```
+상황 3: 메모리 부족(프로듀서 버퍼)
+```
+# 메모리 문제 유발 설정 - 이건 버퍼가 계속 쌓일 수 있다
+memory_issue_config = {
+    'retries': 2147483647,  # 무한 재시도
+    'delivery_timeout_ms': 86400000,  # 24시간
+    'max_block_ms': 86400000,  # 24시간 블로킹
+    'buffer_memory': 134217728,  # 128MB
+}
+
+# 메모리 안전 설정
+memory_safe_config = {
+    'retries': 5,
+    'delivery_timeout_ms': 300000,  # 5분
+    'max_block_ms': 10000,  # 10초만 블로킹
+    'buffer_memory': 33554432,  # 32MB
+}
+```  
+</details>
+<details>
+  <summary>권장 설정 예시</summary>
+
+### 보수적설정
+```
+# 절대 메모리 부족이 일어나면 안 되는 시스템
+ultra_safe_config = {
+    'retries': 3,  # 적은 재시도
+    'delivery_timeout_ms': 30000,  # 30초
+    'max_block_ms': 1000,  # 1초만 블로킹
+    'buffer_memory': 16777216,  # 16MB만 사용
+    'batch_size': 8192,  # 작은 배치 크기
+    'linger_ms': 0,  # 즉시 전송
+}
+```
+### 균형설정(실무권장)
+```
+# 대부분의 상황에서 안전한 설정
+balanced_safe_config = {
+    'retries': 5,
+    'delivery_timeout_ms': 120000,  # 2분
+    'max_block_ms': 10000,  # 10초 블로킹
+    'buffer_memory': 33554432,  # 32MB
+    'batch_size': 16384,
+    'linger_ms': 100,
+    
+    # 안전장치 추가
+    'enable_idempotence': True,
+    'acks': 'all',
+}
+```
+</details>
+
+
+
+
+### (4) 재시도 가능여부를 판단
+- 프로듀서는 재시도 가능여부를 스스로 판단
+- **어떻게?**
+  - 브로커가 응답으로 에러코드 전송
+  - 클라이언트 라이브러리에 에러코드별 정책이 미리 내장됨
+
 - **재시도 가능 오류 (Retriable Errors)**
     - 프로듀서가 자동으로 처리할 수 있는 일시적인 오류.
     - 예: `LEADER_NOT_AVAILABLE` (리더가 일시적으로 없는 경우로, 재시도 시 해결 가능).
+    - 브로커-1
 - **재시도 불가능 오류 (Non-retriable Errors)**
     - 재시도해도 해결되지 않는 영구적인 오류.
     - 예: `INVALID_CONFIG` (설정 오류로, 메시지를 다시 보낸다고 해결되지 않음).
-- **권장 설정**
-    - **`retries`:** 기본값인 `MAX_INT` (사실상 무한대)로 유지.
-    - **`delivery.timeout.ms`:** 메시지 전송을 포기하기까지의 최대 대기 시간을 설정. 프로듀서는 이 시간 내에서 가능한 한 많이 재시도함.
-- **재시도와 메시지 중복**
-    - 재시도는 '최소 한 번 전송(At-least-once)'을 보장하지만, 네트워크 문제 등으로 중복 전송을 유발할 수 있음.
-    - **`enable.idempotence=true`:** 이 옵션을 사용하면 프로듀서가 레코드에 추가 정보를 포함시켜 브로커가 재시도로 인한 중복 메시지를 제거함 (멱등성 프로듀서).
 <br>
 
-### (4) 추가적인 오류 처리 (개발자 책임)
+### (5) 추가적인 오류 처리 (개발자 책임)
 - 프로듀서의 자동 재시도로 해결되지 않는 오류들은 개발자가 직접 코드에서 처리해야 함.
 - **처리 대상 오류 종류**
     - 재시도 불가능한 브로커 오류 (메시지 크기 초과, 인증 오류 등).
