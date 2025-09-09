@@ -1050,6 +1050,96 @@ balanced_safe_config = {
     - **커밋된 오프셋:** 컨슈머가 특정 오프셋까지의 모든 메시지를 성공적으로 처리했다고 카프카에 알리는 값.
 <br>
 
+### (1-1) 오프셋커밋 과정 및 구현
+- 자동커밋
+  - 메시지 손실보다 처리량이 중요한 경우
+  - 백그라운드에서 비동기적으로 커밋 실행
+  ```
+  enable_auto_commit=True
+  auto_commit_interval_ms=5000  # 5초마다 커밋
+  ```
+- 수동커밋
+  - 메시지 손실이 절대 허용되지 않는 경우 사용  
+  - 메시지 처리 완료 후 명시적으로 커밋 함수 호출
+    ```
+    KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props);
+    consumer.subscribe(Arrays.asList("order-events"));
+    ...
+    consumer.commitSync()  #오프셋 커밋 함수 호출 -> 브로커의 __consumer_offsets에 오프셋기록(로그파일에 기록)
+    ...
+    
+    ```
+
+<details>
+  <summary>실무용 예시</summary>
+
+  ```
+  import org.apache.kafka.clients.consumer.CommitFailedException;
+  import org.apache.kafka.common.errors.WakeupException;
+  
+  public class ProductionConsumer {
+      private volatile boolean running = true;
+      
+      public static void main(String[] args) {
+          new ProductionConsumer().consume();
+      }
+      
+      public void consume() {
+          Properties props = createProps();
+          KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props);
+          
+          // 엔지니어 독백: "Graceful shutdown을 위한 훅 등록"
+          Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+              System.out.println("Shutdown 신호 받음");
+              running = false;
+              consumer.wakeup();
+          }));
+          
+          try {
+              consumer.subscribe(Arrays.asList("user-events"));
+              
+              while (running) {
+                  try {
+                      ConsumerRecords<String, String> records = 
+                          consumer.poll(Duration.ofMillis(1000));
+                      
+                      for (ConsumerRecord<String, String> record : records) {
+                          processWithRetry(consumer, record);
+                      }
+                      
+                  } catch (WakeupException e) {
+                      // 엔지니어 독백: "정상적인 shutdown 신호"
+                      if (running) throw e;
+                  }
+              }
+              
+          } catch (Exception e) {
+              System.err.println("예상치 못한 에러: " + e.getMessage());
+          } finally {
+              consumer.close();
+              System.out.println("Consumer 정상 종료");
+          }
+      }
+      
+      private void processWithRetry(KafkaConsumer<String, String> consumer, 
+                                   ConsumerRecord<String, String> record) {
+          int maxRetries = 3;
+          
+          for (int attempt = 1; attempt <= maxRetries; attempt++) {
+              try {
+                  boolean success = processUser(record.value());
+                  
+                  if (success) {
+                      commitWithRetry(consumer);
+                      return; // 성공하면 리턴
+                  }
+                  
+              } catch (Exception e) {
+                  // 엔지니어 독백: "재시도할
+  ``` 
+</details>
+<br><br>
+
 ### (2) 신뢰성 있는 처리를 위한 주요 설정
 - **`group.id`**
     - 동일한 `group.id`를 가진 컨슈머들은 하나의 그룹으로 묶여, 구독한 토픽의 파티션을 나누어 처리함 (메시지 분산 처리).
