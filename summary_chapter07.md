@@ -1064,106 +1064,288 @@ balanced_safe_config = {
     ```
     KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props);
     consumer.subscribe(Arrays.asList("order-events"));
+    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+
     ...
     consumer.commitSync()  #오프셋 커밋 함수 호출 -> 브로커의 __consumer_offsets에 오프셋기록(로그파일에 기록)
     ...
     
     ```
-
-<details>
-  <summary>실무용 예시</summary>
-
-  ```
-  import org.apache.kafka.clients.consumer.CommitFailedException;
-  import org.apache.kafka.common.errors.WakeupException;
-  
-  public class ProductionConsumer {
-      private volatile boolean running = true;
-      
-      public static void main(String[] args) {
-          new ProductionConsumer().consume();
-      }
-      
-      public void consume() {
-          Properties props = createProps();
-          KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props);
-          
-          // 엔지니어 독백: "Graceful shutdown을 위한 훅 등록"
-          Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-              System.out.println("Shutdown 신호 받음");
-              running = false;
-              consumer.wakeup();
-          }));
-          
-          try {
-              consumer.subscribe(Arrays.asList("user-events"));
-              
-              while (running) {
-                  try {
-                      ConsumerRecords<String, String> records = 
-                          consumer.poll(Duration.ofMillis(1000));
-                      
-                      for (ConsumerRecord<String, String> record : records) {
-                          processWithRetry(consumer, record);
-                      }
-                      
-                  } catch (WakeupException e) {
-                      // 엔지니어 독백: "정상적인 shutdown 신호"
-                      if (running) throw e;
-                  }
-              }
-              
-          } catch (Exception e) {
-              System.err.println("예상치 못한 에러: " + e.getMessage());
-          } finally {
-              consumer.close();
-              System.out.println("Consumer 정상 종료");
-          }
-      }
-      
-      private void processWithRetry(KafkaConsumer<String, String> consumer, 
-                                   ConsumerRecord<String, String> record) {
-          int maxRetries = 3;
-          
-          for (int attempt = 1; attempt <= maxRetries; attempt++) {
-              try {
-                  boolean success = processUser(record.value());
-                  
-                  if (success) {
-                      commitWithRetry(consumer);
-                      return; // 성공하면 리턴
-                  }
-                  
-              } catch (Exception e) {
-                  // 엔지니어 독백: "재시도할
-  ``` 
-</details>
 <br><br>
+
+
+
 
 ### (2) 신뢰성 있는 처리를 위한 주요 설정
 - **`group.id`**
-    - 동일한 `group.id`를 가진 컨슈머들은 하나의 그룹으로 묶여, 구독한 토픽의 파티션을 나누어 처리함 (메시지 분산 처리).
-    - 토픽의 모든 메시지를 각 컨슈머가 개별적으로 수신해야 한다면, 고유한 `group.id`를 사용해야 함 (메시지 브로드캐스팅).
+    - 동일한 `group.id`=컨슈머 그룹(메시지 분산 처리).
+    - 고유한 `group.id` = 컨슈머 1개만 수신.
+    - 반드시 지정해야함
 - **`auto.offset.reset`**
-    - 커밋된 오프셋이 없거나, 요청한 오프셋이 브로커에 존재하지 않을 때 컨슈머의 동작을 결정.
+    - 읽을 커밋된 오프셋이 없거나, 요청한 오프셋이 브로커에 존재하지 않을 때 컨슈머의 동작을 결정.
     - **`earliest`:** 가장 처음부터 메시지를 읽음. 중복 처리가 발생할 수 있으나 데이터 유실을 최소화.
+      - 데이터 유실 없음, 중복 발생
     - **`latest`:** 가장 마지막부터 메시지를 읽음. 중복 처리는 최소화되지만, 컨슈머가 동작하지 않는 동안 쌓인 메시지를 놓칠 수 있음 (데이터 유실).
+      - 유실 가능
+    - 기본값 : `latest`
 - **`enable.auto.commit`**
-    - 오프셋 커밋을 자동으로 할지, 수동으로 할지 결정하는 중요한 선택.
+    - 오프셋 커밋을 자동 or 수동 결정
     - **`true` (자동 커밋):** 구현이 간편함. `poll()` 루프 내에서 모든 처리가 끝나는 단순한 경우에 유용. 하지만 처리가 완료되기 전에 커밋이 발생하여 데이터가 유실될 위험이 있고, 중복 처리 제어가 어려움.
     - **`false` (수동 커밋):** 처리가 완료된 시점을 명확히 보장해야 하는 복잡한 로직(예: 별도 스레드 처리)에서는 반드시 사용해야 함.
 - **`auto.commit.interval.ms`**
     - 자동 커밋(`enable.auto.commit=true`) 사용 시, 얼마나 자주 커밋할지를 결정 (기본값 5초).
     - 주기를 짧게 하면 중복 처리 가능성은 줄지만, 브로커에 대한 오버헤드가 증가함.
+  ```
+  public class ConsumerExample {
+      public static void main(String[] args) {
+          // 1. Consumer 설정
+          Properties props = new Properties();
+          props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+          
+          // 동일한 group.id → 같은 그룹으로 묶임
+          props.put(ConsumerConfig.GROUP_ID_CONFIG, "my-consumer-group");  
+  
+          // 브로커에 오프셋이 없을 경우 earliest or latest
+          props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");  
+  
+          // 자동 커밋 여부
+          props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "true");  // 기본값 true
+          props.put(ConsumerConfig.AUTO_COMMIT_INTERVAL_MS_CONFIG, "5000"); // 기본 5초
+          
+          props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringDeserializer");
+          props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringDeserializer");
+  
+          // 2. Consumer 생성
+          KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props);
+  
+          // 3. 토픽 구독
+          consumer.subscribe(Collections.singletonList("test-topic"));
+  
+          // 4. 메시지 poll loop
+          try {
+              while (true) {
+                  // poll() = 브로커에서 메시지 가져오기
+                  ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+                  
+                  for (ConsumerRecord<String, String> record : records) {
+                      System.out.printf("Consumed message: key=%s, value=%s, partition=%d, offset=%d%n",
+                              record.key(), record.value(), record.partition(), record.offset());
+                  }
+                  
+                  // 만약 enable.auto.commit=false 라면, 직접 commit 필요
+                  // consumer.commitSync();
+              }
+          } finally {
+              consumer.close();
+          }
+      }
+  }
+  ```
+  - `group.id`
+    - my-consumer-group 이라는 이름으로 그룹에 속함 → 토픽 파티션을 나눠서 소비.
+  - `auto.offset.reset`
+    - "earliest" → 오프셋이 없으면 처음부터 읽기 시작.
+  - `enable.auto.commit`
+    - `true` → poll 후 일정 주기(5초)에 자동으로 오프셋 커밋.
+    - `false`로 하면 → consumer.commitSync() 같은 메서드로 수동 커밋 필요.
 <br>
 
 ### (3) 명시적 오프셋 커밋 (수동 커밋)
+```
+public class PerMessageCommitConsumer {
+    public static void main(String[] args) {
+        Properties props = new Properties();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "example-group");
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false"); // 반드시 false
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringDeserializer");
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringDeserializer");
+
+        KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props);
+        consumer.subscribe(Collections.singletonList("my-topic"));
+
+        try {
+            while (true) {
+                // 1) poll로 브로커에서 메시지 받음 (ConsumerRecords는 메모리에 있음)
+                ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(500));
+
+                for (ConsumerRecord<String, String> record : records) {
+                    try {
+                        // 2) 메시지 처리 — 여기에 DB 저장 등 비즈니스 로직 수행
+                        process(record);
+
+                        // 3) 처리 완료 후 즉시 커밋 (항상 record.offset() + 1 을 커밋)
+                        TopicPartition tp = new TopicPartition(record.topic(), record.partition());
+                        OffsetAndMetadata oam = new OffsetAndMetadata(record.offset() + 1);
+                        consumer.commitSync(Collections.singletonMap(tp, oam));
+
+                    } catch (Exception e) {
+                        // 처리 실패: 절대 커밋하지 않음 → 재처리 가능
+                        System.err.println("Processing failed, not committing offset for record: " + record);
+                        e.printStackTrace();
+                    }
+                }
+            }
+        } catch (WakeupException e) {
+            // 외부에서 shutdown 신호를 받아 안전하게 빠져나오는 경우 처리
+        } finally {
+            try {
+                // 종료 직전에 남아있는 offset을 커밋하려면 여기서 commitSync 해도 됨
+                consumer.commitSync();
+            } catch (Exception ex) {
+                // 로그
+            } finally {
+                consumer.close();
+            }
+        }
+    }
+
+    private static void process(ConsumerRecord<String, String> record) {
+        // 실제 처리 로직: DB insert, 외부 API 호출 등
+        System.out.printf("Processed: topic=%s partition=%d offset=%d value=%s%n",
+                          record.topic(), record.partition(), record.offset(), record.value());
+    }
+}
+```
+- ENABLE_AUTO_COMMIT_CONFIG = false
+  → 자동 커밋 비활성화. 수동으로 커밋 제어해야 함(필수).
+- consumer.poll(Duration.ofMillis(500))
+  → 브로커에서 메시지를 가져와 ConsumerRecords 객체로 반환. 이 데이터는 컨슈머 프로세스의 메모리에 있다.
+- process(record)
+  → 비즈니스 로직 수행. 이 함수가 성공해야만 해당 메시지는 안전하게 처리되었다고 판단.
+- new OffsetAndMetadata(record.offset() + 1)
+  → 중요: Kafka에서 커밋해야 하는 값은 “다음에 읽어야 할 offset”이므로 처리한 메시지의 offset + 1 을 커밋해야 한다.
+  잘못해서 record.offset()만 커밋하면 같은 메시지를 다시 읽을 수 있음(경계문제), 또는 더 심각한 경우 논리적 오류 발생.
+- consumer.commitSync(map)
+  → 동기 커밋: 브로커에 커밋이 확정될 때까지 블록. 실패 시 예외를 던짐(재시도 정책 필요). 안전성 우선 선택.
+- catch (Exception e)에서 커밋을 안 함
+  → 처리 실패 시 오프셋을 커밋하지 않아 다음에 재처리되도록 함. (→ at-least-once 보장)
+- finally에서 consumer.commitSync() 후 consumer.close()
+  → 종료 직전에 아직 커밋 안 된 오프셋을 한번 더 시도해서 유실을 줄일 수 있음.
+<br>
+
 - **메시지 처리 후 항상 커밋:** 오프셋 커밋은 반드시 메시지에 대한 모든 처리가 성공적으로 완료된 후에 수행해야 함.
 - **커밋 빈도는 트레이드오프:**
     - 커밋은 `acks=all` 프로듀싱과 유사하게 성능 오버헤드가 있는 작업.
     - 너무 잦은 커밋(예: 메시지마다 커밋)은 성능을 저하시키고, 너무 드문 커밋은 장애 시 중복 처리되는 데이터 양을 늘림.
+    - 배치커밋 예시코드
+    ```
+    int batchSize = 10;  
+    int processedCount = 0;  
+    long lastCommitTime = System.currentTimeMillis();
+    
+    while (true) {
+        ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+        for (ConsumerRecord<String, String> record : records) {
+            process(record.value());
+            processedCount++;
+    
+            // ✅ 배치 사이즈 단위로 커밋
+            if (processedCount % batchSize == 0) {
+                consumer.commitSync();
+                System.out.println("Committed after batch size: " + batchSize);
+            }
+    
+            // ✅ 또는 일정 시간 단위로 커밋
+            if (System.currentTimeMillis() - lastCommitTime > 5000) {
+                consumer.commitSync();
+                lastCommitTime = System.currentTimeMillis();
+                System.out.println("Committed after 5 seconds interval");
+            }
+        }
+    }
+    
+    ```
 - **정확한 오프셋 커밋:** `poll()`로 읽은 마지막 오프셋이 아닌, '성공적으로 처리한 마지막 메시지의 다음 오프셋'을 커밋해야 함. 실수로 처리하지 않은 메시지의 오프셋을 커밋하면 데이터 유실로 이어짐.
 - **리밸런스 처리:** 컨슈머 리밸런스가 발생할 것을 대비해야 함. 파티션 소유권을 잃기 전에 현재까지 처리한 오프셋을 커밋하고, 애플리케이션이 유지하던 상태(state)를 정리하는 로직이 필요함.
+
+  ```
+  1. 초기 상태
+    - C1 → P0, P1
+    - C2 → P2, P3
+  
+  2. C2 장애 발생 (죽음 / 네트워크 끊김)
+    - 그룹 코디네이터(브로커 중 1대)가 C2가 heartbeat 응답을 안 한다는 걸 감지.
+    - 그룹 코디네이터가 리밸런스(rebalance) 시작.
+  
+  3. 리밸런스 실행 과정
+    - 그룹 내 컨슈머들에게 "너희 지금 갖고 있던 파티션 반환해" 요청 (revocation).
+    - 이 시점에 C1은 자신이 갖고 있던 파티션(P0, P1) 을 잠시 내려놓아야 함.
+    - 이유: C1이 새롭게 C2가 맡던 P2, P3도 가져갈 수 있게 하기 위함.
+  
+  4. 파티션 소유권 반환 전에 해야 할 일
+    - C1이 현재 P0, P1에서 처리하다가 아직 커밋하지 않은 메시지가 있을 수 있음.
+    - 만약 여기서 커밋하지 않고 소유권을 잃으면?
+      - C1이 처리했지만 커밋 안 된 메시지 → 새 컨슈머가 다시 읽음 → 중복 처리 발생.
+    - 그래서 “파티션 소유권을 잃기 전에 오프셋을 commitSync() 해라” 라고 하는 것.
+  
+  5. 새로운 파티션 재할당
+    그룹 코디네이터가 새롭게 분배:
+      - C1 → P0, P1, P2, P3 (C2 죽었으니 전부 맡음)
+    - 이 시점이 onPartitionsAssigned 이벤트.
+    - 컨슈머는 이제 새 파티션의 상태를 초기화하고 다시 poll() 시작.
+  ```
+<br>
+
+- 리밸런스처리 코드 전 백그라운드 지식
+- poll() 안에 숨겨진 동작 이해 필요
+  -poll() 은 단순히 "메시지 가져오기"만 하는 게 아니라, 컨슈머 그룹 조정(group coordination) 관련 모든 일을 다 합니다.
+  구체적으로 poll() 이 실행될 때:
+  -heartbeat 전송
+    -컨슈머는 주기적으로 그룹 코디네이터(브로커 중 1대)에 heartbeat를 보냄.
+    -이걸로 "나 아직 살아있다" 신호를 줌.
+  -리밸런스 감지
+    -그룹 코디네이터가 "컨슈머가 추가/제거됐다" → 리밸런스 필요하다고 응답하면,
+    -poll() 내부에서 리밸런스 프로세스를 자동 실행.
+  -리밸런스 실행 시점
+    -이때, 컨슈머가 기존 파티션을 내려놓기 직전에 →
+    -ConsumerRebalanceListener.onPartitionsRevoked() 자동 호출.
+    -그리고 새 파티션을 할당받으면 →
+    -ConsumerRebalanceListener.onPartitionsAssigned() 자동 호출.
+   
+
+  ```
+  consumer.subscribe(Collections.singletonList("test-topic"), new ConsumerRebalanceListener() {
+      @Override
+      public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
+          // ✅ 리밸런스 직전 → 현재까지 처리한 오프셋 커밋
+          consumer.commitSync();
+          System.out.println("Offsets committed before partition revocation: " + partitions);
+      }
+  
+      @Override
+      public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
+          // ✅ 새 파티션 할당 시 필요한 상태 초기화
+          System.out.println("New partitions assigned: " + partitions);
+      }
+  });
+  
+  while (true) {
+      ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+      for (ConsumerRecord<String, String> record : records) {
+          process(record.value());
+      }
+  }
+
+- `subscribe(..., new ConsumerRebalanceListener())`
+  → 단순히 토픽 구독만 하는 게 아니라, 리밸런스 이벤트에 반응할 콜백 함수 등록.
+
+- `onPartitionsRevoked()`
+  → 소유하고 있던 파티션이 회수되기 직전에 호출.
+  → 여기서 commitSync() 하는 이유:
+  내가 맡았던 파티션의 마지막 처리 위치를 브로커에 남겨야, 이후 새 컨슈머가 이어서 읽을 때 중복/유실이 줄어듦.
+
+- `onPartitionsAssigned()`
+  → 새로운 파티션이 나에게 할당되었을 때 호출.
+  → 여기서 필요한 초기화 가능 (예: 상태 초기화, 특정 오프셋에서부터 시작하도록 seek() 호출).
+- while문
+- 이 루프는 평상시 메시지를 가져와서 처리하는 역할.
+- 리밸런스 발생 → poll() 도중 내부적으로 리밸런스 로직이 실행
+  → 위에서 등록한 onPartitionsRevoked() / onPartitionsAssigned() 콜백이 자동으로 호출됨.
+
+  ```
+
+
 <br>
 
 ### (4) 고급 컨슈머 처리 패턴
@@ -1175,9 +1357,203 @@ balanced_safe_config = {
     - 이동 평균 계산 등 여러 `poll()` 호출에 걸쳐 상태를 유지해야 하는 경우, 오프셋뿐만 아니라 애플리케이션의 상태도 함께 복구해야 함.
     - **패턴:** 오프셋을 커밋하는 시점에, 계산된 상태 값(예: 현재까지의 평균)을 별도의 토픽에 함께 기록. 컨슈머 재시작 시, 마지막으로 저장된 상태 값과 오프셋을 함께 읽어 작업을 재개.
     - **권장 사항:** 이런 복잡한 상태 기반 처리는 직접 구현하기보다 Kafka Streams, Flink와 같은 스트림 처리 프레임워크를 사용하는 것이 안정적이고 효율적임.
-<br><br><br>
+<br>
 
+- 예시코드  
+[1] 재시도가 필요한 경우
+패턴 1: Pause and Retry
+```
+import org.apache.kafka.clients.consumer.*;
+import org.apache.kafka.common.TopicPartition;
+import java.time.Duration;
+import java.util.*;
 
+public class PauseAndRetryConsumer {
+    private static final String TOPIC = "test-topic";
+    private static final List<ConsumerRecord<String, String>> retryBuffer = new ArrayList<>();
+
+    public static void main(String[] args) {
+        Properties props = new Properties();
+        props.put("bootstrap.servers", "localhost:9092");
+        props.put("group.id", "retry-consumer-group");
+        props.put("enable.auto.commit", "false");
+        props.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+        props.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+
+        KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props);
+        consumer.subscribe(Collections.singletonList(TOPIC));
+
+        while (true) {
+            ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+            for (ConsumerRecord<String, String> record : records) {
+                try {
+                    process(record.value()); // 메시지 처리
+                    consumer.commitSync(Collections.singletonMap(
+                            new TopicPartition(record.topic(), record.partition()),
+                            new OffsetAndMetadata(record.offset() + 1)
+                    ));
+                } catch (Exception e) {
+                    System.err.println("처리 실패, 메시지를 버퍼에 저장: " + record.value());
+                    retryBuffer.add(record);
+
+                    // 새 메시지 안 받도록 해당 파티션 일시 정지
+                    consumer.pause(Collections.singleton(new TopicPartition(record.topic(), record.partition())));
+                }
+            }
+
+            // 재시도 로직 (간단히: 버퍼 비우고 다시 처리 시도)
+            Iterator<ConsumerRecord<String, String>> it = retryBuffer.iterator();
+            while (it.hasNext()) {
+                ConsumerRecord<String, String> failedRecord = it.next();
+                try {
+                    process(failedRecord.value()); // 다시 처리
+                    consumer.commitSync(Collections.singletonMap(
+                            new TopicPartition(failedRecord.topic(), failedRecord.partition()),
+                            new OffsetAndMetadata(failedRecord.offset() + 1)
+                    ));
+                    it.remove(); // 성공하면 버퍼에서 제거
+                } catch (Exception retryEx) {
+                    System.err.println("재시도 실패: " + failedRecord.value());
+                }
+            }
+
+            // 버퍼가 비면 다시 resume
+            if (retryBuffer.isEmpty()) {
+                consumer.resume(consumer.paused());
+            }
+        }
+    }
+
+    private static void process(String value) throws Exception {
+        if (value.contains("fail")) {
+            throw new RuntimeException("처리 실패 강제 발생");
+        }
+        System.out.println("처리 성공: " + value);
+    }
+}
+
+```
+- pause() / resume()을 사용해 문제 있는 파티션에서 새 메시지를 받지 않음.
+- 실패 메시지는 retryBuffer에 저장했다가 재처리 시도.
+- 성공한 메시지까지만 오프셋 커밋.
+
+패턴 2: Dead-Letter Queue (DLQ)
+```
+import org.apache.kafka.clients.consumer.*;
+import org.apache.kafka.clients.producer.*;
+import org.apache.kafka.common.TopicPartition;
+
+import java.time.Duration;
+import java.util.*;
+
+public class DLQConsumer {
+    private static final String INPUT_TOPIC = "test-topic";
+    private static final String DLQ_TOPIC = "dlq-topic";
+
+    public static void main(String[] args) {
+        Properties consumerProps = new Properties();
+        consumerProps.put("bootstrap.servers", "localhost:9092");
+        consumerProps.put("group.id", "dlq-consumer-group");
+        consumerProps.put("enable.auto.commit", "false");
+        consumerProps.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+        consumerProps.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+
+        KafkaConsumer<String, String> consumer = new KafkaConsumer<>(consumerProps);
+        consumer.subscribe(Collections.singletonList(INPUT_TOPIC));
+
+        Properties producerProps = new Properties();
+        producerProps.put("bootstrap.servers", "localhost:9092");
+        producerProps.put("acks", "all");
+        producerProps.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+        producerProps.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+        KafkaProducer<String, String> producer = new KafkaProducer<>(producerProps);
+
+        while (true) {
+            ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+            for (ConsumerRecord<String, String> record : records) {
+                try {
+                    process(record.value());
+                    consumer.commitSync(Collections.singletonMap(
+                            new TopicPartition(record.topic(), record.partition()),
+                            new OffsetAndMetadata(record.offset() + 1)
+                    ));
+                } catch (Exception e) {
+                    System.err.println("처리 실패, DLQ로 전송: " + record.value());
+                    producer.send(new ProducerRecord<>(DLQ_TOPIC, record.key(), record.value()));
+                    consumer.commitSync(Collections.singletonMap(
+                            new TopicPartition(record.topic(), record.partition()),
+                            new OffsetAndMetadata(record.offset() + 1)
+                    ));
+                }
+            }
+        }
+    }
+
+    private static void process(String value) throws Exception {
+        if (value.contains("fail")) {
+            throw new RuntimeException("처리 실패 강제 발생");
+        }
+        System.out.println("처리 성공: " + value);
+    }
+}
+
+```
+- 실패 메시지는 DLQ_TOPIC으로 바로 보냄.
+- DLQ는 별도의 컨슈머 그룹이 구독해서 재처리를 담당.
+- 메인 컨슈머는 실패 메시지를 스킵하고 다음으로 진행 가능.
+
+- 02.상태유지가 필요한경우
+```
+import org.apache.kafka.clients.consumer.*;
+import org.apache.kafka.common.TopicPartition;
+
+import java.time.Duration;
+import java.util.*;
+
+public class StatefulConsumer {
+    private static final String TOPIC = "test-topic";
+    private static int runningSum = 0;
+    private static int count = 0;
+
+    public static void main(String[] args) {
+        Properties props = new Properties();
+        props.put("bootstrap.servers", "localhost:9092");
+        props.put("group.id", "stateful-consumer-group");
+        props.put("enable.auto.commit", "false");
+        props.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+        props.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+
+        KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props);
+        consumer.subscribe(Collections.singletonList(TOPIC));
+
+        while (true) {
+            ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+            for (ConsumerRecord<String, String> record : records) {
+                int value = Integer.parseInt(record.value());
+                runningSum += value;
+                count++;
+                double avg = (double) runningSum / count;
+
+                System.out.println("현재 평균: " + avg);
+
+                // ✅ 상태와 오프셋을 함께 저장 (여기선 단순히 출력, 실제는 DB/상태 토픽 저장)
+                saveStateAndOffset(record, runningSum, count);
+            }
+        }
+    }
+
+    private static void saveStateAndOffset(ConsumerRecord<String, String> record, int sum, int count) {
+        System.out.printf("상태 저장 - Partition: %d, Offset: %d, Sum: %d, Count: %d%n",
+                record.partition(), record.offset(), sum, count);
+        // 예시: DB 저장 or "state-topic"에 프로듀싱 가능
+    }
+}
+
+```
+- 단순 오프셋만 저장하면, 재시작 시 평균 같은 계산 상태가 날아감.
+- 따라서 오프셋과 **계산 상태(runningSum, count 등)**를 함께 저장해야 함.
+- Kafka Streams 같은 프레임워크는 이런 상태 관리(체크포인팅, 복구)를 자동으로 해줌.
+<br><br>
 
 
 
@@ -1185,6 +1561,26 @@ balanced_safe_config = {
 <br>
 
 ### (1) 설정 검증
+> "흠… 지금 우리가 구축한 카프카 클러스터, 설정 제대로 했나?
+acks=all로 했으니까 메시지 손실은 거의 없겠지만, 혹시 브로커 하나 죽으면 어떻게 될까?
+재시도 횟수(retries)랑 ISR(동기 복제본) 설정도 확인해봐야겠다.
+그냥 눈으로 보는 것보다, VerifiableProducer/Consumer로 테스트하는 게 빠르겠군.
+1부터 1000까지 메시지 쏴서, 컨슈머가 순서대로 받는지 확인하면,
+리더 브로커가 날아가도 제대로 failover 되는지 체크 가능하겠네.
+컨트롤러도 재시작해보고, 롤링 리스타트하면서 메시지 유실 없는지 체크해야겠다.
+결국 목적은… 설정값이 실제 상황에서 의도대로 동작하는지 눈으로 확인하는 거지.
+코드 수정은 필요 없고, 설정값 보고 테스트 돌리면서 로그 확인하면 돼."
+
+```
+언제 사용하는가:
+- 클러스터 초기 구성 후, 혹은 설정 변경 후 안정성 검증할 때.
+무엇을 하는가:
+- 메시지 순서, 오프셋 관리, 리더/컨트롤러 failover 동작을 실제로 확인.
+엔지니어 역할:
+- 도구 실행 → 로그 확인 → 설정값 조정 → 재검증 반복.
+코드 작성?
+- 직접 Kafka 애플리케이션 코드는 안 건드림. 그냥 테스트용 VerifiableProducer/Consumer 실행.
+```
 - **목적:**
     - 선택한 브로커 및 클라이언트 설정이 신뢰성 요구사항을 충족하는지 테스트.
     - 시스템의 예상 동작을 미리 파악하고 이해하기 위한 연습.
@@ -1200,6 +1596,23 @@ balanced_safe_config = {
 <br>
 
 ### (2) 애플리케이션 검증
+
+> "자, 이제 브로커 설정은 검증했으니, 실제 내 애플리케이션이 제대로 동작하는지 확인해야지.
+내가 작성한 컨슈머 코드에서 오프셋 커밋이나 리밸런스 리스너가 의도대로 동작하는지 테스트해봐야 한다.
+예를 들어 컨슈머가 갑자기 죽으면, 커밋된 마지막 오프셋까지만 인정되고 나머지는 다시 처리되어야 하는지 확인해야지.
+잠깐… 네트워크 끊김이나 지연 상황을 시뮬레이션할 수도 있겠네.
+Disk full 같은 상황도 테스트해야 하고… 브로커 롤링 리스타트하면서 메시지 유실 없는지도 봐야 한다.
+결국 목표는 애플리케이션이 각종 장애 상황에서도 데이터 신뢰성을 유지하는지 확인하는 거야.
+테스트 코드는 직접 작성해야 하고, 필요하면 장애 주입용 스크립트나 Trogdor 같은 프레임워크를 쓴다.
+로그와 모니터링도 체크하고, 실패하면 코드 로직 수정이나 커밋 타이밍 조정, 재시도 로직 강화 같은 결정을 내려야지."
+
+포인트
+언제 사용하는가:
+프로듀서/컨슈머 애플리케이션이 실제 장애 시에도 안정적으로 동작하는지 검증할 때.
+무엇을 하는가:
+장애 주입(네트워크 끊김, 디스크 문제, 브로커 재시작 등) → 코드 동작 확인 → 오프셋 커밋/재처리 로직 확인.
+엔지니어 역할:테스트 코드 작성, 장애 시나리오 구현, 로그/상태 확인 → 필요하면 코드 수정.
+
 - **목적:** 브로커/클라이언트 설정 검증 후, 애플리케이션 로직(오류 처리, 오프셋 커밋, 리밸런스 리스너 등)이 의도한 대로 동작하는지 확인.
 - **검증 방법:** 다양한 장애 상황을 주입하는 통합 테스트(Integration Test) 수행.
 - **주요 장애 주입 시나리오:**
@@ -1214,7 +1627,38 @@ balanced_safe_config = {
     - 카프카 자체적으로 `Trogdor`라는 테스트 프레임워크를 포함.
 <br>
 
+
+
 ### (3) 운영 환경에서의 신뢰성 모니터링
+
+
+
+
+> "이제 테스트 환경은 끝났고, 실제 운영 환경에서 신뢰성을 유지해야 한다.
+매일 Kafka가 문제 없이 돌아가는지 확인해야 하는데, 모니터링이 핵심이지.
+프로듀서는 error-rate, retry-rate를 보고, 재시도가 잦으면 원인을 찾아야 한다.
+WARN 로그도 체크하고, ERROR 로그가 나오면 메시지가 완전히 날아간 상황일 수 있으니 바로 조사.
+컨슈머는 가장 중요한 consumer lag를 봐야 한다.
+조금 변동 있는 건 괜찮지만, 지속적으로 증가하면 컨슈머가 따라오지 못하는 거니까 원인 찾아서 스케일 아웃하거나 처리 속도 개선해야지.
+그리고 종단 간 데이터 흐름도 확인해야 한다. 메시지가 생성된 시간과 소비된 시간을 비교해서 지연이 있는지 체크.
+필요하면 Confluent Control Center나 Burrow 같은 모니터링 도구를 사용해서 알람 설정.
+브로커 메트릭도 주기적으로 확인. FailedProduceRequestsPerSec나 FailedFetchRequestsPerSec가 갑자기 늘어나면 조사 시작.
+결국 목표는 문제가 발생하기 전에 감지하고, 운영 중에도 데이터 신뢰성을 지속적으로 유지하는 것."
+
+포인트
+언제 사용하는가:
+운영 중 실시간으로 시스템 안정성을 체크할 때.
+무엇을 하는가:
+JMX 메트릭 모니터링, 로그 분석, lag 체크, 엔드투엔드 지연 시간 측정.
+엔지니어 역할:
+모니터링 시스템 설정, 알람 정책 정의, 필요 시 조치(컨슈머 스케일링, 브로커 조사, 설정 조정).
+코드 작성?
+직접 애플리케이션 코드보다는 모니터링/알람 스크립트, 대시보드 설정 중심.
+
+
+
+
+
 - **목적:** 테스트만으로는 부족하며, 실제 운영 환경에서 데이터 흐름이 예상대로 유지되는지 지속적으로 모니터링해야 함.
 - **모니터링 영역:**
     - **프로듀서 모니터링:**
