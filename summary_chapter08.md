@@ -97,3 +97,105 @@
   - `read_committed` 모드는 트랜잭션이 완료될 때까지 데이터 소비가 지연될 수 있음 (end-to-end latency 증가)
 - **핵심**: Exactly-Once는 성능(특히 지연 시간)과 데이터 정합성을 맞바꾸는 트레이드오프 관계
   - 비즈니스 요구사항에 맞춰 배치 크기를 조절하는 튜닝이 필수적임
+<br><br>
+
+
+
+---
+<br><br>
+
+
+
+실습
+
+## 1. 트랜잭션을 위한 환경 준비
+### 브로커(서버) 측
+- 특별히 명령어를 실행할 필요 없음. Kafka 0.11 이상이면 트랜잭션 지원됨.
+- 내부적으로 트랜잭션 상태를 저장할 __transaction_state 토픽이 자동 생성됨.
+- 다만 브로커 설정 예시:
+
+```
+# server.properties
+transaction.state.log.replication.factor=3
+transaction.state.log.min.isr=2
+```
+- `transaction.state.log.replication.factor` : 트랜잭션 상태 로그 복제 수
+- `transaction.state.log.min.isr` : 트랜잭션 상태 로그 최소 ISR
+- 의미: 브로커가 트랜잭션 상태를 안정적으로 저장하고, 장애 발생 시 복구 가능하게 설정
+
+### 컨슈머 측
+- isolation.level 설정 필요
+```
+# consumer.properties
+isolation.level=read_committed
+enable.auto.commit=false
+```
+- `isolation.level=read_committed` : 커밋된 트랜잭션 메시지만 읽도록 설정
+- `enable.auto.commit=false` : 오프셋 커밋을 트랜잭션과 연계하도록 설정
+
+
+
+
+## 2. 프로듀서 측 트랜잭션 설정
+<br>
+
+### 2-1. 프로듀서 생성 시 설정
+- 프로듀서 코드/컨테이너에서 설정
+```
+Properties props = new Properties();
+props.put("bootstrap.servers", "localhost:9092");
+props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+
+// 트랜잭션 관련 설정
+props.put("enable.idempotence", "true");                // 멱등성 활성화
+props.put("transactional.id", "my-unique-transactional-id");  // 트랜잭션 ID 설정
+```
+
+의미:
+- enable.idempotence=true : 프로듀서 재시도 시 중복 전송 방지
+- transactional.id : 트랜잭션을 구분하는 고유 ID, 재시작 후에도 동일 ID를 사용해야 함
+<br>
+
+### 2-2. 트랜잭션 API 호출 순서
+```
+// 1. 트랜잭션 초기화
+producer.initTransactions();  
+// 브로커와 통신하여 해당 transactional.id 초기화, epoch 번호 관리 시작
+
+try {
+    // 2. 트랜잭션 시작
+    producer.beginTransaction();
+    // 이 시점부터 send되는 메시지는 트랜잭션에 묶임
+
+    // 3. 메시지 전송
+    producer.send(new ProducerRecord<>("my-topic", key, value));
+
+    // 4. 컨슈머 오프셋 트랜잭션에 포함
+    Map<TopicPartition, OffsetAndMetadata> offsets = ...
+    producer.sendOffsetsToTransaction(offsets, consumerGroupId);
+
+    // 5. 트랜잭션 커밋
+    producer.commitTransaction();  
+    // 성공하면 메시지와 오프셋 모두 커밋, 컨슈머가 읽을 수 있음
+
+} catch (Exception e) {
+    // 실패 시 트랜잭션 롤백
+    producer.abortTransaction();
+    // 메시지와 오프셋이 모두 롤백
+}
+```
+
+**의미:** 
+- `initTransactions()` : 트랜잭션 환경 초기화, 브로커와 epoch 번호 동기화
+- `beginTransaction()` : 새 트랜잭션 시작
+- `send()` : 메시지를 트랜잭션에 포함
+- `sendOffsetsToTransaction()` : 읽은 컨슈머 오프셋까지 트랜잭션에 포함 → 중복 재처리 방지
+- `commitTransaction()` : 성공 시 메시지+오프셋 동시 확정
+- `abortTransaction()` : 실패 시 메시지+오프셋 동시 롤백
+<br>
+
+## 3. 실무 적용 위치
+- 프로듀서 컨테이너/애플리케이션에서 코드 작성
+- 컨슈머 컨테이너/애플리케이션에서 isolation.level 설정
+- 브로커는 설정 파일(server.properties)만 확인, 트랜잭션 상태와 펜싱은 자동 처리
