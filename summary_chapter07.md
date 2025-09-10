@@ -1907,3 +1907,55 @@ kafka-run-class.sh kafka.tools.JmxTool \
 - OneMinuteRate = 최근 1분 평균(초당 비율),
 - Count = broker 시작 후 누적 카운트.
 <br><br><br>
+
+
+
+
+---
+
+### 1. Lag 값의 본질
+- Lag = LOG-END-OFFSET(브로커가 가진 최신 메시지 위치) − CURRENT-OFFSET(컨슈머 그룹이 커밋한 위치)
+- LOG-END-OFFSET
+  → 브로커가 갖고 있는 최신 메시지 offset (브로커 디스크에 저장됨)
+CURRENT-OFFSET
+  → 컨슈머 그룹이 __consumer_offsets 토픽에 커밋한 offset 값
+즉, lag는 브로커 데이터(최신 offset) 와 커밋된 offset 을 비교해서 계산하는 거야.
+
+
+### 2. 어디서 계산되나?
+- 물리적 데이터는 전부 Kafka 브로커 디스크에 있음
+  - 메시지 로그: /var/lib/kafka/data/<topic>-<partition>/*.log
+  - 커밋 offset 로그: /var/lib/kafka/data/__consumer_offsets-*/.log
+- Lag 계산은 컨슈머가 아니라 브로커 툴이 함
+  - 예: kafka-consumer-groups.sh 실행하면, 이 툴이 브로커에 접속해서 두 값을 가져와 빼기 연산 해서 보여줌.
+  - Burrow, Control Center 같은 모니터링 툴도 결국 이 계산을 자동화한 거고.
+
+
+### 3. 실제 확인 방법
+- 컨슈머 컨테이너가 아니라 Kafka 브로커 컨테이너에서 확인해야 해.
+```
+# 특정 컨슈머 그룹의 lag 확인
+kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --describe --group <group_id>
+```
+
+출력 예시:
+```
+TOPIC           PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG  CONSUMER-ID
+my-topic        0          100             105             5    consumer-1
+```
+
+- `CURRENT-OFFSET` → __consumer_offsets 토픽에 기록된 값
+- `LOG-END-OFFSET` → 브로커가 파티션별로 가진 최신 메시지 위치
+- LAG = 둘의 차이
+
+
+
+### 4. 정리
+- Lag는 브로커 쪽 정보로 계산됨 (컨슈머가 직접 계산 X).
+- 브로커 디스크:
+  - 메시지 데이터 = <topic>-<partition>/*.log
+  - 오프셋 데이터 = __consumer_offsets-*/.log
+- 계산 주체: 브로커 메타데이터를 조회하는 Kafka 툴 or 모니터링 시스템.
+- 확인 위치: Kafka 브로커 컨테이너 (거기서 kafka-consumer-groups.sh 실행).
