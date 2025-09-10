@@ -99,7 +99,15 @@
   - 비즈니스 요구사항에 맞춰 배치 크기를 조절하는 튜닝이 필수적임
 <br><br>
 
-
+**좀비펜싱 원리 및 과정**
+| 시간 | 이벤트 | Producer | Broker | 결과 |
+| :--- | :--- | :--- | :--- | :--- |
+| **t1** | A 시작 | `initTransactions()`, `beginTransaction()` | `epoch=1` | 트랜잭션 활성 |
+| **t2** | A 메시지 전송 | `send()` | 메시지 저장, commit 전 격리 | Consumer는 읽지 못함 |
+| **t3** | A 종료 | 종료 | `epoch=1` 트랜잭션 중단 | 메시지 일부만 브로커에 남음 |
+| **t4** | B 시작 | `initTransactions()` | `epoch=2` | B 트랜잭션 활성, 이전 `epoch=1` 메시지 차단 준비 |
+| **t5** | A 지연 메시지 도착 | `send()` | `epoch=1` < `epoch=2` → 거부(Fencing) | 메시지 무시, 데이터 일관성 유지 |
+| **t6** | B 메시지 전송, commit | `send()` → `commitTransaction()` | `epoch=2` 커밋 | Consumer가 안전하게 읽음 |
 
 ---
 <br><br>
