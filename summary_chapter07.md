@@ -1551,7 +1551,7 @@ public class StatefulConsumer {
 
 ```
 - 단순 오프셋만 저장하면, 재시작 시 평균 같은 계산 상태가 날아감.
-- 따라서 오프셋과 **계산 상태(runningSum, count 등)**를 함께 저장해야 함.
+- 따라서 오프셋과 **계산 상태(runningSum, count 등)** 를 함께 저장해야 함.
 - Kafka Streams 같은 프레임워크는 이런 상태 관리(체크포인팅, 복구)를 자동으로 해줌.
 <br><br>
 
@@ -1585,16 +1585,153 @@ acks=all로 했으니까 메시지 손실은 거의 없겠지만, 혹시 브로�
     - 선택한 브로커 및 클라이언트 설정이 신뢰성 요구사항을 충족하는지 테스트.
     - 시스템의 예상 동작을 미리 파악하고 이해하기 위한 연습.
 - **검증 도구:**
-    - 카프카는 `org.apache.kafka.tools` 패키지 내에 검증용 도구를 포함.
+    - 카프카는 `org.apache.kafka.tools` 패키지 내에 검증용 도구를 포함.(Kafka의 kafka.tools 안에 있음.)
     - **`VerifiableProducer`:** 1부터 지정된 숫자까지 순차적인 메시지를 생성. `acks`, `retries` 등 실제 프로듀서와 동일하게 설정 가능하며 각 메시지의 전송 성공/실패를 출력.
     - **`VerifiableConsumer`:** `VerifiableProducer`가 보낸 메시지를 소비하여 순서대로 출력. 오프셋 커밋 및 리밸런스 정보도 함께 출력.
+
+```
+01. 테스트 환경준비
+- 테스트 토픽생성
+  kafka-topics.sh --create --topic test-verifiable \
+                            --bootstrap-server localhost:9092 \
+                             --partitions 3 \
+                            --replication-factor 1 \
+
+02. VerifiableProducer 실행
+[코드]
+kafka-verifiable-producer.sh \
+  --topic test-verifiable \
+  --broker-list localhost:9092 \
+  --throughput 1000 \
+  --num-records 10000
+[옵션 설명]
+--topic: 테스트할 토픽
+--broker-list: Kafka 브로커
+--throughput: 초당 메시지 수 (-1 = 제한 없음)
+--num-records: 생산할 메시지 총 개수
+[동작]
+-메시지를 1~10000까지 시퀀스 번호와 함께 생성
+-메시지 키, 값에 시퀀스 번호 포함
+-생산 과정 로그 출력
+
+
+03. VerifiableConsumer 실행
+kafka-verifiable-consumer.sh \
+  --topic test-verifiable \
+  --bootstrap-server localhost:9092 \
+  --group test-group \
+  --max-messages 10000
+[옵션 설명]
+--group: Consumer Group
+--max-messages: 소비할 메시지 수
+[동작]
+-메시지 순서 확인
+-누락 메시지 체크
+-중복 메시지 체크
+-결과 통계 출력
+  Records consumed: 10000
+  Records missing: 0
+  Records out of order: 0
+
+04. 결과 확인
+- 토픽 메시지수 확인
+kafka-run-class.sh kafka.tools.GetOffsetShell \
+  --broker-list localhost:9092 \
+  --topic test-verifiable \
+  --time -1  #마지막 offset 조회
+ [결과]
+test-verifiable:0:10000
+test-verifiable:1:10000
+test-verifiable:2:10000
+→ 정상도달
+
+- 컨슈머 그룹 확인
+kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group test-group
+[출력결과]
+| TOPIC           | PARTITION | CURRENT-OFFSET | LOG-END-OFFSET | LAG | CONSUMER-ID |
+| --------------- | --------- | -------------- | -------------- | --- | ----------- |
+| test-verifiable | 0         | 10000          | 10000          | 0   | ...         |
+| test-verifiable | 1         | 10000          | 10000          | 0   | ...         |
+| test-verifiable | 2         | 10000          | 10000          | 0   | ...         |
+
+
+```
+
+> “어? Consumer 로그에 Records missing: 23?
+뭐야, Producer는 10,000개 찍었다고 했는데… 파티션별로 몇 개 빠졌나 보자.
+먼저 토픽 마지막 offset 확인해보자.
+GetOffsetShell --time -1 … 아, 파티션 1에서 10000인데 Consumer는 9977까지만 읽었네.
+
+> 왜 23개가 사라진 걸까… 잠깐, 브로커 설정 먼저 확인.
+acks=1로만 되어 있으면 브로커가 메시지를 받기 전에 실패하면 유실될 수 있지.
+복제(replication)는 몇 개였더라…? replication-factor=1이라면, 브로커 하나 죽으면 끝이야.
+min.insync.replicas 확인해봐야겠다. 1개면… 아, 이거 너무 취약한 세팅이네.
+
+> Producer 쪽도 확인해보자. enable.idempotence 꺼져 있으면 재시도 시 중복 발생 가능하고, 네트워크 타임아웃 때 유실될 수도 있음.
+재시도(retries) 세팅도 확인. retries=0이면 실패하면 그냥 날라가.
+
+> Consumer 쪽? Consumer 그룹 lag 확인… 음, lag=0이면 메시지는 이미 읽었지만, out-of-order나 offset skip 발생했을 수도 있겠다.
+혹시 auto.commit 간격(auto.commit.interval.ms) 때문에 커밋이 늦어서 offset이 건너뛴 건 아닌가?
+
+> 네트워크 상태도 체크. 브로커와 Producer 사이에 패킷 손실이 있었을 수도 있고, GC pause로 Producer가 잠깐 멈췄을 수도 있지.
+또… 토픽 파티션 수와 Consumer 수 확인. 컨슈머 개수가 파티션보다 많으면 놀고 있는 컨슈머가 생기면서 일부 메시지가 처리되지 않을 수도 있어.
+> 마지막으로, 토픽 레벨 설정. retention.ms나 segment.bytes가 너무 짧게 잡혀 있으면 메시지가 만료되기 전에 읽기 전에 사라질 수도 있지.
+
+> 결론: 우선 로그, offset, ack, replication, retries, Consumer commit, 네트워크까지 순서대로 점검해야 한다.
+이거 하나씩 체크해서 원인 좁히면 된다. 아, Kafka는 메시지 유실 원인을 한 번에 알 수 없으니까, 시스템 전체를 엔드 투 엔드로 점검하는 게 필수야.”
+<br>
+
 - **주요 테스트 시나리오:**
     - **리더 선출:** 특정 파티션의 리더 브로커를 중단시켰을 때, 프로듀서와 컨슈머가 정상화되기까지 걸리는 시간 측정.
     - **컨트롤러 선출:** 컨트롤러 브로커를 재시작했을 때, 시스템이 정상화되는 시간 측정.
-      - 컨트롤러는 브로커들 메타데이터 관리자 
+      - 컨트롤러는 브로커들 메타데이터 관리자
+      - AWS에서 AZ영역에서 장애가 발생 -> 카프카 날라감
     - **롤링 리스타트:** 브로커를 하나씩 재시작하는 동안 메시지 유실이 없는지 확인.
-    - 카프카 버전업데이트,  
+      - 카프카 버전업데이트, 마이그레이션 할때
+      - replication-factor=3, min.insync.replicas=2 설정으로 최소 2개 브로커가 항상 살아있어야 함.
+      - K8s에서 카프카 statefulset 업데이트중 여러 pod가 죽은경우
     - **정결하지 못한 리더 선출 테스트:** 파티션의 모든 복제본을 순서대로 중단시켜 Out-of-Sync 상태로 만든 후, Out-of-Sync 상태였던 브로커를 재시작했을 때 어떤 현상이 발생하는지 확인.
+      - 데이터 센터 정전으로 모든 브로커가 동시에 죽었다가, 복구시점에 일부만 먼저 살아난 경우.
+
+```
+가장 무서운 시나리오
+(1)정상적인 리더 선출
+파티션 0: Leader=1, ISR=[1,2,3]
+브로커 1 죽음 → 브로커 2나 3이 리더 됨 (데이터 안전)
+
+(2)비정상적인 상황
+파티션 0: Leader=1, ISR=[1,2,3]
+1. 브로커 1 죽음 → Leader=2, ISR=[2,3]  
+2. 브로커 2 죽음 → Leader=3, ISR=[3]
+3. 브로커 3도 죽음 → ISR=[] (모든 복제본 Out-of-Sync!)
+
+이때 브로커 1이 먼저 살아나면?
+→ 브로커 1은 과거 데이터만 가지고 있음
+→ 브로커 2,3이 죽기 전 받은 최신 메시지들은 유실됨!
+
+(3)Unclean Leader Election 설정
+unclean.leader.election.enable=true   # 데이터 유실 감수하고 가용성 선택
+unclean.leader.election.enable=false  # 가용성보다 데이터 안전성 선택 (권장)
+
+(4)대책도 없는데 왜 테스트를 하나?
+- 발생시 보완책을 강구하기 위해서 
+    옵션 A (unclean=true): 
+    - 2.3초 내 서비스 복구, 하지만 156개 주문 데이터 유실
+    - 예상 손실: $12,000
+    
+    옵션 B (unclean=false):
+    - 45.7초 서비스 중단, 하지만 데이터 100% 보존  
+    - 예상 손실: $89,000
+    
+    어떤 정책을 선택하시겠습니까?"
+
+- 테스트로 '언제 개입해야 하는지' 임계점을 찾아내는 거야."
+- 복구 순서를매뉴얼에 따라 진행해보려
+- 멀티 AZ구성에 대한 필요성 인지위해 
+- "특히 금융권에서는 데이터 유실 가능성을 정량적으로 측정해서 리스크 관리 보고서에 포함해야 해."
+
+```
+
 <br>
 
 ### (2) 애플리케이션 검증
@@ -1645,35 +1782,128 @@ WARN 로그도 체크하고, ERROR 로그가 나오면 메시지가 완전히 �
 브로커 메트릭도 주기적으로 확인. FailedProduceRequestsPerSec나 FailedFetchRequestsPerSec가 갑자기 늘어나면 조사 시작.
 결국 목표는 문제가 발생하기 전에 감지하고, 운영 중에도 데이터 신뢰성을 지속적으로 유지하는 것."
 
-포인트
-언제 사용하는가:
-운영 중 실시간으로 시스템 안정성을 체크할 때.
-무엇을 하는가:
-JMX 메트릭 모니터링, 로그 분석, lag 체크, 엔드투엔드 지연 시간 측정.
-엔지니어 역할:
-모니터링 시스템 설정, 알람 정책 정의, 필요 시 조치(컨슈머 스케일링, 브로커 조사, 설정 조정).
-코드 작성?
-직접 애플리케이션 코드보다는 모니터링/알람 스크립트, 대시보드 설정 중심.
+**포인트**
+**언제 사용하는가:**
+- 운영 중 실시간으로 시스템 안정성을 체크할 때.
+**무엇을 하는가:**
+- JMX 메트릭 모니터링, 로그 분석, lag 체크, 엔드투엔드 지연 시간 측정.
+**엔지니어 역할:**
+- 모니터링 시스템 설정, 알람 정책 정의, 필요 시 조치(컨슈머 스케일링, 브로커 조사, 설정 조정).
+**코드 작성?**
+- 직접 애플리케이션 코드보다는 모니터링/알람 스크립트, 대시보드 설정 중심.
+<br>
 
 
 
+### 목적:
+  - 테스트만으로는 부족하며, 실제 운영 환경에서 데이터 흐름이 예상대로 유지되는지 지속적으로 모니터링해야 함.
+  - 일시적 확인, 지속적 수집 파이프라인 구축(필요시)
+### 모니터링 영역:
+**(1)프로듀서 모니터링:**
+- 왜: 메시지를 브로커에 보내는 과정에서 문제가 발생하면 데이터 유실로 이어질 수 있음.
+- 주요 수치
+  - error-rate: 메시지 전송 실패율 → 높으면 브로커 문제, 네트워크 문제, 설정 오류 가능
+  - retry-rate: 재시도율 → 높으면 브로커 지연/응답 불가, 네트워크 불안정
+- 로그
+  - WARN: 재시도 발생, 일시적 문제
+  - ERROR: 메시지 전송 완전 실패 (데이터 유실 가능)
+- 활용 방식
+  - JMX 메트릭 수집 → Grafana 대시보드
+  - 로그 수집 → ELK/EFK 스택
+  - 알람 설정 → error-rate > threshold → Slack/메일 알람
+- JMX기반 수치 확인(Java Management Extensions)
+  ```
+  jconsole localhost:9999
+  
+  ```
+  - 접속 후 MBeans 탭 → kafka.producer → type=producer-metrics → record-error-rate 확인
+  - 출력예
+  ```
+  #mbean = kafka.producer:type=producer-metrics,client-id=producer-1:
+  record-error-rate = 0.0;
+  record-retry-rate = 0.002;
+  ```
+  - 해석
+    - record-error-rate = 0.0
+      → 메시지 전송이 정상적으로 성공. 오류 없음.
+    - record-retry-rate = 0.002
+      → 전체 요청 중 약 0.2%가 재시도 발생.
+      → 약간의 네트워크 지연이나 브로커 부하가 있었지만, 대부분 정상 처리.
+    - 만약 error-rate이 0.05 이상(5%)로 치솟는다면:
+      - 네트워크 단절, 브로커 다운, 토픽 권한 문제, acks 설정 불일치 같은 심각한 문제 가능.
+    - 만약 retry-rate이 급격히 올라가고 error-rate도 함께 증가한다면:
+      - 브로커가 요청을 처리하지 못하는 병목 상태일 수 있음. (ex. ISR 부족, 리더 파티션 불안정)
 
-- **목적:** 테스트만으로는 부족하며, 실제 운영 환경에서 데이터 흐름이 예상대로 유지되는지 지속적으로 모니터링해야 함.
-- **모니터링 영역:**
-    - **프로듀서 모니터링:**
-        - **주요 JMX 메트릭:** `error-rate`(오류율), `retry-rate`(재시도율). 이 수치가 증가하면 시스템 문제의 신호일 수 있음.
-        - **로그 모니터링:** `WARN` 레벨의 재시도 로그, 특히 "0 attempts left"(재시도 소진) 로그 확인. `ERROR` 레벨 로그는 메시지 전송이 완전히 실패했음을 의미.
-    - **컨슈머 모니터링:**
-        - **가장 중요한 메트릭:** `consumer lag` (컨슈머가 최신 메시지로부터 얼마나 뒤처져 있는지를 나타냄).
-        - 랙(lag)은 약간의 변동이 정상이지만, 지속적으로 증가하는 것은 문제.
-        - `Burrow` (by LinkedIn)와 같은 도구를 사용하면 랙 모니터링 및 알림 설정이 용이함.
-    - **종단 간(End-to-End) 데이터 흐름 모니터링:**
-        - 모든 생성된 데이터가 비즈니스 요구사항에 맞는 시간 내에 소비되는지 확인.
-        - 메시지 타임스탬프를 활용하여 '생성 시간'과 '소비 시간' 간의 지연 시간을 측정.
-        - 프로듀서의 초당 생성 메시지 수와 컨슈머의 초당 소비 메시지 수를 비교하여 유실 여부 확인.
-        - Confluent Control Center 등 상용 솔루션이 이러한 기능을 제공.
-    - **브로커 모니터링 (오류 메트릭):**
-        - **주요 메트릭:** `FailedProduceRequestsPerSec`, `FailedFetchRequestsPerSec`.
-        - 롤링 리스타트 중 발생하는 `NOT_LEADER_FOR_PARTITION` 오류처럼 일부 오류는 정상적인 상황에서도 발생 가능.
-        - 설명되지 않는 오류율 증가는 반드시 원인을 조사해야 함.
+- 로그 확인
+  ```
+  tail -f /var/log/kafka/producer.log | grep WARN
+  tail -f /var/log/kafka/producer.log | grep ERROR
+  ```
+  - WARN: 일시적 재시도 발생
+  - ERROR: 메시지 전송 실패 → 유실 가능
+<br>
+
+
+**(2)컨슈머 모니터링:**
+- consumer lag : 컨슈머가 아직 읽지 못한 메시지 개수
+- 계산식:
+  - LAG = LOG-END-OFFSET - CURRENT-OFFSET
+    - LOG-END-OFFSET: 브로커(토픽 파티션)에 쌓여 있는 최신 메시지 위치
+    - CURRENT-OFFSET: 컨슈머 그룹이 마지막으로 읽고 커밋한 메시지 위치
+  - LAG: 아직 처리되지 않고 대기 중인 메시지 개수
+- 해석
+  - Lag = 0
+      → 컨슈머가 최신 메시지까지 다 따라잡음 (실시간 처리 상태)
+  - Lag가 소폭 변동
+      → 메시지가 유입되고 소비되는 정상적인 상황
+  - Lag가 지속적으로 증가
+      → 프로듀서는 메시지를 계속 넣는데 컨슈머가 따라잡지 못함 → 병목 발생
+      → 원인: 컨슈머 처리 속도 부족, 브로커 부하, 네트워크 지연
+- 확인
+  ```
+  [명령어 실행]
+  kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group my-consumer-group
+  [결과]
+  TOPIC           PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+  test-topic      0          2000            2500            500
+  [해석]
+  Lag = 500 → 500개의 메시지가 아직 처리되지 않고 큐에 대기 중
+  ```
+- 모니터링도구 활용
+  - Burrow: Consumer Lag 자동 추적, 알람 설정 가능
+  - Prometheus + Grafana: Lag을 그래프로 시각화해 추세 분석 
+<br>
+
+**(3)종단 간(End-to-End) 데이터 흐름 모니터링:**
+- 모든 생성된 데이터가 비즈니스 요구사항에 맞는 시간 내에 소비되는지 확인.
+- 메시지 타임스탬프를 활용하여 '생성 시간'과 '소비 시간' 간의 지연 시간을 측정.
+- 프로듀서의 초당 생성 메시지 수와 컨슈머의 초당 소비 메시지 수를 비교하여 유실 여부 확인.
+- Confluent Control Center 등 상용 솔루션이 이러한 기능을 제공.
+- 코드로 로그 남겨서 확인
+<br>
+
+**(4)브로커 모니터링 (오류 메트릭):**
+- 확인 대상
+  - `FailedProduceRequestsPerSec`: 브로커가 처리하지 못한 Produce 요청의 비율(처리실패율), 0이면 정상
+  - `FailedFetchRequestsPerSec` : 브로커가 처리하지 못한 fetch요청(컨슈머가 메시지를 가져오는 요청)의 비율, 0이면 정상
+  - `UnderReplicatedPartitions` : ISR에 포함되지 않은 파티션 수, 0이면 정상
+  - NOT_LEADER_FOR_PARTITION 로그 : 파티션의 현재 리더가 아닌 브로커로 요청이 들어와 발생하는 오류. 정상적인 상황에서도 발생가능
+- 설명되지 않는 오류율 증가는 반드시 원인을 조사해야 함.
+- JMX로 직접 확인
+```
+# FailedProduceRequestsPerSec의 1분 평균값(OneMinuteRate) 조회 예시
+kafka-run-class.sh kafka.tools.JmxTool \
+  --jmx-url service:jmx:rmi:///jndi/rmi://<broker-host>:9999/jmxrmi \
+  --object-name "kafka.server:type=BrokerTopicMetrics,name=FailedProduceRequestsPerSec" \
+  --attribute OneMinuteRate
+
+# UnderReplicatedPartitions 조회
+kafka-run-class.sh kafka.tools.JmxTool \
+  --jmx-url service:jmx:rmi:///jndi/rmi://<broker-host>:9999/jmxrmi \
+  --object-name "kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions" \
+  --attribute Value
+
+```
+- OneMinuteRate = 최근 1분 평균(초당 비율),
+- Count = broker 시작 후 누적 카운트.
 <br><br><br>
